@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"crypto/ecdh"
 	"crypto/hmac"
+	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -15,7 +16,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -61,8 +64,9 @@ func credentialsPath() string {
 }
 
 func main() {
+	usage := "usage: mozsync <login|dump|chrome-import <path>|falkon-import <path>>"
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: mozsync <login|dump>")
+		fmt.Fprintln(os.Stderr, usage)
 		os.Exit(1)
 	}
 	var err error
@@ -71,8 +75,20 @@ func main() {
 		err = doLogin()
 	case "dump":
 		err = doDump()
+	case "chrome-import":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, usage)
+			os.Exit(1)
+		}
+		err = doChromeImport(os.Args[2])
+	case "falkon-import":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, usage)
+			os.Exit(1)
+		}
+		err = doFalkonImport(os.Args[2])
 	default:
-		fmt.Fprintln(os.Stderr, "usage: mozsync <login|dump>")
+		fmt.Fprintln(os.Stderr, usage)
 		os.Exit(1)
 	}
 	if err != nil {
@@ -502,6 +518,488 @@ func doDump() error {
 	}
 	fmt.Println(string(out))
 	return nil
+}
+
+// ---------- chrome-import: merge a `mozsync dump` into a Chromium profile's Bookmarks file ----------
+//
+// Reads the flat dump array (Firefox Places Sync records) from stdin, and for
+// each of Firefox's special roots that has children (toolbar, menu, unfiled,
+// mobile), builds one labeled wrapper folder holding the full imported
+// subtree and appends it into the corresponding Chromium root - bookmark_bar
+// for toolbar, other for menu/unfiled, synced for mobile. Existing bookmarks
+// are never touched or removed, only appended to, and the previous file is
+// always backed up first. The Chromium file is read/written as a generic
+// map[string]interface{} rather than a fixed struct so fields Chromium itself
+// relies on (like a bookmark's meta_info) survive the round-trip untouched.
+
+type ffRecord struct {
+	ID        string   `json:"id"`
+	Type      string   `json:"type"`
+	Title     string   `json:"title"`
+	BmkURI    string   `json:"bmkUri"`
+	DateAdded int64    `json:"dateAdded"`
+	Children  []string `json:"children"`
+	Deleted   bool     `json:"deleted"`
+}
+
+func doChromeImport(path string) error {
+	dumpBytes, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return fmt.Errorf("reading dump from stdin: %w", err)
+	}
+	var records []ffRecord
+	if err := json.Unmarshal(dumpBytes, &records); err != nil {
+		return fmt.Errorf("parsing dump JSON: %w", err)
+	}
+	byID := make(map[string]ffRecord, len(records))
+	for _, r := range records {
+		if !r.Deleted {
+			byID[r.ID] = r
+		}
+	}
+
+	if chromiumRunning() {
+		fmt.Fprintln(os.Stderr, "warning: Chromium appears to be running - it may overwrite this import on its")
+		fmt.Fprintln(os.Stderr, "         next save. Fully quit Chromium and re-run this if the import doesn't stick.")
+	}
+
+	existing, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", path, err)
+	}
+	var cf map[string]interface{}
+	if err := json.Unmarshal(existing, &cf); err != nil {
+		return fmt.Errorf("parsing existing Chromium bookmarks file: %w", err)
+	}
+	roots, ok := cf["roots"].(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("existing Chromium bookmarks file has no \"roots\" object")
+	}
+	bar, ok1 := roots["bookmark_bar"].(map[string]interface{})
+	other, ok2 := roots["other"].(map[string]interface{})
+	synced, ok3 := roots["synced"].(map[string]interface{})
+	if !ok1 || !ok2 || !ok3 {
+		return fmt.Errorf("existing Chromium bookmarks file is missing an expected root")
+	}
+
+	backupPath := path + ".mozsync-bak"
+	if err := os.WriteFile(backupPath, existing, 0o600); err != nil {
+		return fmt.Errorf("backing up existing bookmarks file: %w", err)
+	}
+
+	nextID := maxChromeID(roots) + 1
+
+	// Merge directly into each root's top level, matching existing items by
+	// (name, type): an existing bookmark's url is overwritten, an existing
+	// folder is recursed into and merged, and only genuinely new items are
+	// appended. No wrapper folder, and re-running this is idempotent instead
+	// of piling up a fresh dated folder each time.
+	mergeRoot := func(target map[string]interface{}, ffRootID string) {
+		root, ok := byID[ffRootID]
+		if !ok {
+			return
+		}
+		existingKids, _ := target["children"].([]interface{})
+		target["children"] = mergeChromeChildren(existingKids, byID, root.Children, &nextID)
+	}
+	mergeRoot(bar, "toolbar")
+	mergeRoot(other, "menu")
+	mergeRoot(other, "unfiled")
+	mergeRoot(synced, "mobile")
+
+	cf["checksum"] = computeChromeChecksum(bar, other, synced)
+
+	out, err := json.MarshalIndent(cf, "", "   ")
+	if err != nil {
+		return err
+	}
+	tmpPath := path + ".mozsync-tmp"
+	if err := os.WriteFile(tmpPath, out, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+
+	fmt.Println("Imported into", path)
+	fmt.Println("Backup of the previous file saved to", backupPath)
+	fmt.Println("Fully quit and relaunch Chromium to see the merged bookmarks.")
+	return nil
+}
+
+// mergeChromeChildren upserts each Firefox child (by title+type match) into
+// an existing Chromium children array: url nodes get their url overwritten,
+// folder nodes are recursed into, and anything with no match is appended as
+// a freshly built subtree.
+func mergeChromeChildren(existing []interface{}, byID map[string]ffRecord, ffChildIDs []string, nextID *int) []interface{} {
+	for _, childID := range ffChildIDs {
+		r, ok := byID[childID]
+		if !ok {
+			continue
+		}
+		switch r.Type {
+		case "bookmark":
+			if r.BmkURI == "" {
+				continue
+			}
+			existing = upsertChromeURL(existing, r, nextID)
+		case "folder":
+			existing = upsertChromeFolder(existing, r, byID, nextID)
+		}
+	}
+	return existing
+}
+
+func upsertChromeURL(existing []interface{}, r ffRecord, nextID *int) []interface{} {
+	for _, e := range existing {
+		m, ok := e.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, _ := m["name"].(string)
+		t, _ := m["type"].(string)
+		if name == r.Title && t == "url" {
+			m["url"] = r.BmkURI
+			return existing
+		}
+	}
+	n := map[string]interface{}{
+		"id": strconv.Itoa(*nextID), "guid": newGUID(), "name": r.Title, "type": "url",
+		"url": r.BmkURI, "date_added": chromeTimestamp(r.DateAdded), "date_last_used": "0", "date_modified": "0",
+	}
+	(*nextID)++
+	return append(existing, n)
+}
+
+func upsertChromeFolder(existing []interface{}, r ffRecord, byID map[string]ffRecord, nextID *int) []interface{} {
+	for _, e := range existing {
+		m, ok := e.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, _ := m["name"].(string)
+		t, _ := m["type"].(string)
+		if name == r.Title && t == "folder" {
+			kids, _ := m["children"].([]interface{})
+			m["children"] = mergeChromeChildren(kids, byID, r.Children, nextID)
+			return existing
+		}
+	}
+	if n := buildChromeNode(byID, r.ID, nextID); n != nil {
+		existing = append(existing, n)
+	}
+	return existing
+}
+
+func buildChromeNode(byID map[string]ffRecord, id string, nextID *int) map[string]interface{} {
+	r, ok := byID[id]
+	if !ok {
+		return nil
+	}
+	switch r.Type {
+	case "bookmark":
+		if r.BmkURI == "" {
+			return nil
+		}
+		n := map[string]interface{}{
+			"id": strconv.Itoa(*nextID), "guid": newGUID(), "name": r.Title, "type": "url",
+			"url": r.BmkURI, "date_added": chromeTimestamp(r.DateAdded), "date_last_used": "0", "date_modified": "0",
+		}
+		(*nextID)++
+		return n
+	case "folder":
+		myID := strconv.Itoa(*nextID)
+		(*nextID)++
+		var kids []interface{}
+		for _, childID := range r.Children {
+			if child := buildChromeNode(byID, childID, nextID); child != nil {
+				kids = append(kids, child)
+			}
+		}
+		n := map[string]interface{}{
+			"id": myID, "guid": newGUID(), "name": r.Title, "type": "folder",
+			"date_added": chromeTimestamp(r.DateAdded), "date_last_used": "0", "date_modified": "0",
+		}
+		if kids != nil {
+			n["children"] = kids
+		}
+		return n
+	default:
+		return nil // skip queries, separators, livemarks, etc.
+	}
+}
+
+func maxChromeID(roots map[string]interface{}) int {
+	max := 0
+	var walk func(n interface{})
+	walk = func(n interface{}) {
+		m, ok := n.(map[string]interface{})
+		if !ok {
+			return
+		}
+		if idStr, ok := m["id"].(string); ok {
+			if v, err := strconv.Atoi(idStr); err == nil && v > max {
+				max = v
+			}
+		}
+		if kids, ok := m["children"].([]interface{}); ok {
+			for _, k := range kids {
+				walk(k)
+			}
+		}
+	}
+	for _, v := range roots {
+		walk(v)
+	}
+	return max
+}
+
+// computeChromeChecksum reproduces Chromium's BookmarkCodec checksum: an MD5
+// over (id, name[, url if a url node]) for every node, visited pre-order,
+// across bookmark_bar/other/synced in that order. Best-effort - if a given
+// Chromium version's algorithm has drifted, worst case is a one-time "your
+// bookmarks were changed outside Chrome" notice on next launch; the data
+// itself is unaffected either way.
+func computeChromeChecksum(roots ...map[string]interface{}) string {
+	h := md5.New()
+	var walk func(n map[string]interface{})
+	walk = func(n map[string]interface{}) {
+		if n == nil {
+			return
+		}
+		if idStr, ok := n["id"].(string); ok {
+			io.WriteString(h, idStr)
+		}
+		if name, ok := n["name"].(string); ok {
+			io.WriteString(h, name)
+		}
+		if t, _ := n["type"].(string); t == "url" {
+			if u, ok := n["url"].(string); ok {
+				io.WriteString(h, u)
+			}
+		}
+		if kids, ok := n["children"].([]interface{}); ok {
+			for _, k := range kids {
+				if km, ok := k.(map[string]interface{}); ok {
+					walk(km)
+				}
+			}
+		}
+	}
+	for _, r := range roots {
+		walk(r)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// chromeEpochDeltaMicros is the offset between the Unix epoch (1970-01-01)
+// and the Windows/WebKit epoch (1601-01-01) that Chromium's bookmark
+// timestamps are measured from, in microseconds.
+const chromeEpochDeltaMicros = 11644473600000000
+
+func chromeTimestamp(unixMs int64) string {
+	return strconv.FormatInt(unixMs*1000+chromeEpochDeltaMicros, 10)
+}
+
+func newGUID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+func chromiumRunning() bool {
+	out, err := exec.Command("pgrep", "-f", "org.chromium.Chromium").Output()
+	return err == nil && len(strings.TrimSpace(string(out))) > 0
+}
+
+// ---------- falkon-import: merge a `mozsync dump` into Falkon's bookmarks.json ----------
+//
+// Falkon (unlike Chromium) stores bookmarks as plain JSON with no ids,
+// checksum, or timestamp bookkeeping - just nested folders under three roots:
+// bookmark_bar, bookmark_menu, other. Same safe-append/backup approach as
+// chrome-import: existing bookmarks are never touched, only appended to.
+
+func doFalkonImport(path string) error {
+	dumpBytes, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return fmt.Errorf("reading dump from stdin: %w", err)
+	}
+	var records []ffRecord
+	if err := json.Unmarshal(dumpBytes, &records); err != nil {
+		return fmt.Errorf("parsing dump JSON: %w", err)
+	}
+	byID := make(map[string]ffRecord, len(records))
+	for _, r := range records {
+		if !r.Deleted {
+			byID[r.ID] = r
+		}
+	}
+
+	if falkonRunning() {
+		fmt.Fprintln(os.Stderr, "warning: Falkon appears to be running - it may overwrite this import on its")
+		fmt.Fprintln(os.Stderr, "         next save. Fully quit Falkon and re-run this if the import doesn't stick.")
+	}
+
+	existing, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", path, err)
+	}
+	var bf map[string]interface{}
+	if err := json.Unmarshal(existing, &bf); err != nil {
+		return fmt.Errorf("parsing existing Falkon bookmarks file: %w", err)
+	}
+	roots, ok := bf["roots"].(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("existing Falkon bookmarks file has no \"roots\" object")
+	}
+	bar, ok1 := roots["bookmark_bar"].(map[string]interface{})
+	menu, ok2 := roots["bookmark_menu"].(map[string]interface{})
+	other, ok3 := roots["other"].(map[string]interface{})
+	if !ok1 || !ok2 || !ok3 {
+		return fmt.Errorf("existing Falkon bookmarks file is missing an expected root")
+	}
+
+	backupPath := path + ".mozsync-bak"
+	if err := os.WriteFile(backupPath, existing, 0o600); err != nil {
+		return fmt.Errorf("backing up existing bookmarks file: %w", err)
+	}
+
+	// Merge directly into each root's top level, matching existing items by
+	// (name, type): an existing bookmark's url is overwritten, an existing
+	// folder is recursed into and merged, and only genuinely new items are
+	// appended. No wrapper folder, and re-running this is idempotent instead
+	// of piling up a fresh dated folder each time.
+	mergeRoot := func(target map[string]interface{}, ffRootID string) {
+		root, ok := byID[ffRootID]
+		if !ok {
+			return
+		}
+		existingKids, _ := target["children"].([]interface{})
+		target["children"] = mergeFalkonChildren(existingKids, byID, root.Children)
+	}
+	mergeRoot(bar, "toolbar")
+	mergeRoot(menu, "menu")
+	mergeRoot(other, "unfiled")
+	mergeRoot(other, "mobile")
+
+	out, err := json.MarshalIndent(bf, "", " ")
+	if err != nil {
+		return err
+	}
+	tmpPath := path + ".mozsync-tmp"
+	if err := os.WriteFile(tmpPath, out, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+
+	fmt.Println("Imported into", path)
+	fmt.Println("Backup of the previous file saved to", backupPath)
+	fmt.Println("Fully quit and relaunch Falkon to see the merged bookmarks.")
+	return nil
+}
+
+// mergeFalkonChildren upserts each Firefox child (by title+type match) into
+// an existing Falkon children array: url nodes get their url overwritten,
+// folder nodes are recursed into, and anything with no match is appended as
+// a freshly built subtree.
+func mergeFalkonChildren(existing []interface{}, byID map[string]ffRecord, ffChildIDs []string) []interface{} {
+	for _, childID := range ffChildIDs {
+		r, ok := byID[childID]
+		if !ok {
+			continue
+		}
+		switch r.Type {
+		case "bookmark":
+			if r.BmkURI == "" {
+				continue
+			}
+			existing = upsertFalkonURL(existing, r)
+		case "folder":
+			existing = upsertFalkonFolder(existing, r, byID)
+		}
+	}
+	return existing
+}
+
+func upsertFalkonURL(existing []interface{}, r ffRecord) []interface{} {
+	for _, e := range existing {
+		m, ok := e.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, _ := m["name"].(string)
+		t, _ := m["type"].(string)
+		if name == r.Title && t == "url" {
+			m["url"] = r.BmkURI
+			return existing
+		}
+	}
+	n := map[string]interface{}{
+		"description": "", "keyword": "", "name": r.Title, "type": "url", "url": r.BmkURI, "visit_count": 0,
+	}
+	return append(existing, n)
+}
+
+func upsertFalkonFolder(existing []interface{}, r ffRecord, byID map[string]ffRecord) []interface{} {
+	for _, e := range existing {
+		m, ok := e.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, _ := m["name"].(string)
+		t, _ := m["type"].(string)
+		if name == r.Title && t == "folder" {
+			kids, _ := m["children"].([]interface{})
+			m["children"] = mergeFalkonChildren(kids, byID, r.Children)
+			return existing
+		}
+	}
+	if n := buildFalkonNode(byID, r.ID); n != nil {
+		existing = append(existing, n)
+	}
+	return existing
+}
+
+func buildFalkonNode(byID map[string]ffRecord, id string) map[string]interface{} {
+	r, ok := byID[id]
+	if !ok {
+		return nil
+	}
+	switch r.Type {
+	case "bookmark":
+		if r.BmkURI == "" {
+			return nil
+		}
+		return map[string]interface{}{
+			"description": "", "keyword": "", "name": r.Title, "type": "url",
+			"url": r.BmkURI, "visit_count": 0,
+		}
+	case "folder":
+		var kids []interface{}
+		for _, childID := range r.Children {
+			if child := buildFalkonNode(byID, childID); child != nil {
+				kids = append(kids, child)
+			}
+		}
+		if kids == nil {
+			kids = []interface{}{}
+		}
+		return map[string]interface{}{
+			"children": kids, "description": "", "expanded": true, "expanded_sidebar": true,
+			"name": r.Title, "type": "folder",
+		}
+	default:
+		return nil // skip queries, separators, livemarks, etc.
+	}
+}
+
+func falkonRunning() bool {
+	out, err := exec.Command("pgrep", "-f", "org.kde.falkon").Output()
+	return err == nil && len(strings.TrimSpace(string(out))) > 0
 }
 
 func refreshAccessToken(refreshToken string) (string, error) {

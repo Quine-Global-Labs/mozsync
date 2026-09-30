@@ -11,7 +11,14 @@ tasks:
     generates:
       - mozsync
     cmds:
-      - rm -rf build-dir .flatpak-builder
+      # Deliberately NOT wiping .flatpak-builder here: it holds flatpak-builder's
+      # own build-stage cache (under .flatpak-builder/build/mozsync-1) plus our
+      # persistent GOCACHE (see org.mozsync.App.yml), so unchanged files in the
+      # ~260-file vendored Qt6 binding layer don't get recompiled on every run.
+      # --force-clean only empties build-dir (the final app output), which is cheap.
+      # (Not using --ccache: its lock file went stale after an interrupted build
+      # and hung a subsequent one indefinitely; GOCACHE alone already caches the
+      # compiled cgo/C++ objects, so it's redundant anyway.)
       - flatpak run --command=flatpak-builder org.flatpak.Builder --force-clean build-dir org.mozsync.App.yml
       - cp build-dir/files/bin/mozsync ./mozsync
       - echo "Built ./mozsync - runs directly against the host's Qt6 runtime libs, no flatpak needed."
@@ -27,6 +34,22 @@ tasks:
     deps: [build]
     cmds:
       - ./mozsync dump
+
+  chrome-import:
+    desc: Import your Firefox Sync bookmarks into the Chromium flatpak's bookmark store
+    vars:
+      CHROME_BOOKMARKS: '{{.CHROME_BOOKMARKS | default (printf "%s/.var/app/org.chromium.Chromium/config/chromium/Default/Bookmarks" (env "HOME"))}}'
+    deps: [build]
+    cmds:
+      - ./mozsync dump | ./mozsync chrome-import "{{.CHROME_BOOKMARKS}}"
+
+  falkon-import:
+    desc: Import your Firefox Sync bookmarks into the Falkon flatpak's bookmark store
+    vars:
+      FALKON_BOOKMARKS: '{{.FALKON_BOOKMARKS | default (printf "%s/.var/app/org.kde.falkon/config/falkon/profiles/default/bookmarks.json" (env "HOME"))}}'
+    deps: [build]
+    cmds:
+      - ./mozsync dump | ./mozsync falkon-import "{{.FALKON_BOOKMARKS}}"
 
   clean:
     desc: Remove build artifacts
