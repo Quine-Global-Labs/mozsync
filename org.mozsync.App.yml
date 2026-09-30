@@ -1,0 +1,34 @@
+app-id: org.mozsync.App
+runtime: org.kde.Platform
+runtime-version: "6.11"
+sdk: org.kde.Sdk
+base: io.qt.qtwebengine.BaseApp
+base-version: "6.11"
+command: mozsync
+
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.golang
+
+finish-args:
+  - --share=network
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+
+build-options:
+  append-path: /usr/lib/sdk/golang/bin
+  env:
+    GOFLAGS: -mod=vendor
+    GOCACHE: /run/build/mozsync/.gocache
+    CGO_ENABLED: "1"
+    PKG_CONFIG_PATH: /app/lib/x86_64-linux-gnu/pkgconfig:/app/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig
+
+modules:
+  - name: mozsync
+    buildsystem: simple
+    build-commands:
+      - go build -o mozsync .
+      - install -Dm755 mozsync /app/bin/mozsync
+    sources:
+      - type: dir
+        path: .

@@ -1,0 +1,8 @@
+# github.com/mappu/miqt v0.14.0
+## explicit; go 1.19
+github.com/mappu/miqt/libmiqt
+github.com/mappu/miqt/qt6
+github.com/mappu/miqt/qt6/network
+github.com/mappu/miqt/qt6/printsupport
+github.com/mappu/miqt/qt6/webchannel
+github.com/mappu/miqt/qt6/webengine
