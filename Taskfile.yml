@@ -19,7 +19,16 @@ tasks:
       # (Not using --ccache: its lock file went stale after an interrupted build
       # and hung a subsequent one indefinitely; GOCACHE alone already caches the
       # compiled cgo/C++ objects, so it's redundant anyway.)
-      - flatpak run --command=flatpak-builder org.flatpak.Builder --force-clean build-dir org.mozsync.App.yml
+      #
+      # Wrapped in a low-priority, memory-capped systemd scope so this doesn't
+      # fight other heavy builds (e.g. a concurrent Ladybird/WebKit build) for
+      # RAM and get OOM-killed or thrash into swap. CPUWeight/IOWeight=10 is a
+      # low *share* (yields under contention, still gets full speed if idle);
+      # MemoryHigh=3G is a soft cap Go/cgo get throttled against rather than
+      # killed for. GOMAXPROCS=2 (below) also caps how many parallel cc1plus
+      # processes cgo spawns compiling the vendored Qt6 binding layer, which is
+      # the main memory hog.
+      - systemd-run --user --scope --collect -p CPUWeight=10 -p IOWeight=10 -p MemoryHigh=3G -- flatpak run --command=flatpak-builder org.flatpak.Builder --force-clean build-dir org.mozsync.App.yml
       - cp build-dir/files/bin/mozsync ./mozsync
       - echo "Built ./mozsync - runs directly against the host's Qt6 runtime libs, no flatpak needed."
 

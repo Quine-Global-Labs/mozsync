@@ -21,6 +21,7 @@ build-options:
     GOFLAGS: -mod=vendor
     GOCACHE: /run/build/mozsync/.gocache
     CGO_ENABLED: "1"
+    GOMAXPROCS: "2"
     PKG_CONFIG_PATH: /app/lib/x86_64-linux-gnu/pkgconfig:/app/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig
 
 modules:
