@@ -1,0 +1,34 @@
+version: "3"
+
+tasks:
+  build:
+    desc: Compile mozsync (via a flatpak-builder sandbox, for Qt6WebEngine headers only)
+    sources:
+      - main.go
+      - go.mod
+      - go.sum
+      - org.mozsync.App.yml
+    generates:
+      - mozsync
+    cmds:
+      - rm -rf build-dir .flatpak-builder
+      - flatpak run --command=flatpak-builder org.flatpak.Builder --force-clean build-dir org.mozsync.App.yml
+      - cp build-dir/files/bin/mozsync ./mozsync
+      - echo "Built ./mozsync - runs directly against the host's Qt6 runtime libs, no flatpak needed."
+
+  login:
+    desc: One-time Mozilla account sign-in, saves credentials to ~/.config/mozsync/credentials.json
+    deps: [build]
+    cmds:
+      - ./mozsync login
+
+  dump:
+    desc: Fetch and print your Firefox Sync bookmarks as JSON
+    deps: [build]
+    cmds:
+      - ./mozsync dump
+
+  clean:
+    desc: Remove build artifacts
+    cmds:
+      - rm -rf build-dir .flatpak-builder mozsync
